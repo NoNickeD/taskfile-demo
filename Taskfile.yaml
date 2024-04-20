@@ -1,0 +1,153 @@
+version: '3'
+dotenv: ["awscred"]
+
+tasks:
+  create-infra:
+    desc: "Initialize and deploy AWS infrastructure using Terraform with `deploy.tfvars` configurations."
+    cmds:
+      - echo "🚀 Initializing AWS infrastructure creation."
+      - terraform init
+      - terraform apply --var-file=./config/deploy.tfvars
+    #silent: true
+
+  destroy-infra:
+    desc: "Destroy Terraform-provisioned AWS infrastructure to ensure cleanliness as per `deploy.tfvars`."
+    cmds:
+      - echo "🧹 Cleaning kubeconfig."
+      - >
+        NAME=$(aws eks list-clusters --region $AWS_DEFAULT_REGION --output json --query "clusters[0]" | tr -d '"') &&
+        kubectx -d $NAME
+      - echo "💥 Destroying AWS infrastructure."
+      - terraform destroy --var-file=./config/deploy.tfvars
+    silent: true
+
+  update-kubeconfig:
+    desc: "Retrieve the first Amazon EKS cluster name in a specified AWS region and update kubeconfig for kubectl, setting an alias."
+    cmds:
+      - echo "🔄 Updating kubeconfig from EKS."
+      - >
+        NAME=$(aws eks list-clusters --region $AWS_DEFAULT_REGION --output json --query "clusters[0]" | tr -d '"') &&
+        aws eks update-kubeconfig --name $NAME --region $AWS_DEFAULT_REGION --alias $NAME
+    silent: true
+
+  install-metrics-server:
+    desc: "Install Kubernetes Metrics Server in the matching EKS cluster's region for enhanced resource monitoring."
+    cmds:
+      - >
+        NAME=$(aws eks list-clusters --region $AWS_DEFAULT_REGION --output json --query "clusters[0]" | tr -d '"') &&
+        if [ "$(kubectl config current-context)" = $NAME ]; then
+          echo "📊 Installing Metrics Server..." &&
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        else
+          echo "❌ Context mismatch, installation halted."
+        fi
+    silent: true
+
+  install-cilium:
+    desc: "If Amazon VPC CNI is installed, proceed with Cilium installation in chaining mode to enhance network policies and traffic management in EKS."
+    cmds:
+      - >
+        AWS_CNI_IMAGE=$(kubectl -n kube-system get ds/aws-node -o json | jq -r '.spec.template.spec.containers[0].image') &&
+        if [[ $AWS_CNI_IMAGE == *"amazon-k8s-cni"* ]]; then
+          echo "🔗 Amazon VPC CNI detected, installing Cilium..." &&
+          helm repo add cilium https://helm.cilium.io/ &&
+          helm install cilium cilium/cilium --version 1.15.1 --namespace kube-system --set cni.chainingMode=aws-cni --set cni.exclusive=false --set enableIPv4Masquerade=false --set routingMode=native --set endpointRoutes.enabled=true
+        else
+          echo "⚠️ Amazon VPC CNI missing, Cilium installation skipped."
+        fi
+    silent: true
+
+  upgrade-cilium-for-hubble:
+    desc: "Upgrade Cilium Helm chart to enable Hubble observability if Cilium is operational."
+    cmds:
+      - >
+        if kubectl -n kube-system check pods -l k8s-app=cilium | grep 'Running'; then
+          echo "🌐 Upgrading Cilium for Hubble features..." &&
+          helm upgrade cilium cilium/cilium --version 1.15.1 --namespace kube-system --reuse-values --set hubble.relay.enabled=true --set hubble.ui.enabled=true
+        else
+          echo "⏸️ Cilium not ready, upgrade postponed."
+        fi
+    silent: true
+
+  restart-existing-pods:
+    desc: "New CNI chaining configuration requires restarting existing pods for application and policy enforcement; current pods will remain reachable but won't benefit from these changes."
+    cmds:
+      - >
+        for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
+            ceps=$(kubectl -n "${ns}" get cep \
+                -o jsonpath='{.items[*].metadata.name}')
+            pods=$(kubectl -n "${ns}" get pod \
+                -o custom-columns=NAME:.metadata.name,NETWORK:.spec.hostNetwork \
+                | grep -E '\s(<none>|false)' | awk '{print $1}' | tr '\n' ' ')
+            ncep=$(echo "${pods} ${ceps}" | tr ' ' '\n' | sort | uniq -u | paste -s -d ' ' -)
+            for pod in $(echo $ncep); do
+              echo "${ns}/${pod}";
+            done
+        done
+    silent: true
+
+  install-kuverno:
+    desc: "Install Kuverno for Kubernetes-native policy management and enforcement."
+    cmds:
+      - echo "🛡️ Installing Kuverno..."
+      - helm repo add kyverno https://kyverno.github.io/kyverno/
+      - helm repo update kyverno
+      - helm install kyverno kyverno/kyverno -n kyverno --create-namespace --set admissionController.replicas=3 --set backgroundController.replicas=2 --set cleanupController.replicas=2 --set reportsController.replicas=2
+    silent: true
+
+  install-chaosmesh:
+    desc: "Install Chaos Mesh for Kubernetes-native chaos engineering and fault injection."
+    cmds:
+      - echo "🌀 Installing Chaos Mesh..."
+      - helm repo add chaos-mesh https://charts.chaos-mesh.org
+      - helm repo update chaos-mesh
+      - kubectl create ns chaos-mesh
+      - helm install chaos-mesh chaos-mesh/chaos-mesh -n=chaos-mesh --set chaosDaemon.runtime=containerd --set chaosDaemon.socketPath=/run/containerd/containerd.sock --version 2.6.3
+      - kubectl get pods --namespace chaos-mesh -l app.kubernetes.io/instance=chaos-mesh
+    silent: true
+    
+  install-kubescape-operator:
+    desc: "Install Kubescape Operator for Kubernetes-native security scanning and compliance."
+    cmds:
+      - echo "🛡️ Installing Kubescape Operator..."
+      - helm repo add kubescape https://kubescape.github.io/helm-charts/ 
+      - helm repo update kubescape
+      - helm upgrade --install kubescape kubescape/kubescape-operator -n kubescape --create-namespace --set clusterName=`kubectl config current-context` --set capabilities.continuousScan=enable
+    silent: true
+
+  install-cilium-demo:
+    desc: "Install Cilium demo application for testing network policies and traffic management."
+    cmds:
+      - echo "🧪 Installing Cilium demo application..."
+      - >
+        if kubectl -n kube-system get pods -l k8s-app=cilium | grep 'Running'; then
+          kubectl create -f https://raw.githubusercontent.com/cilium/cilium/1.15.3/examples/minikube/http-sw-app.yaml
+        else
+          echo "⏸️ Cilium not ready, demo installation halted."
+        fi
+    silent: true
+  
+  install-kubeArmor:
+    desc: "Install KubeArmor for Kubernetes-native runtime security and policy enforcement."
+    cmds:
+      - echo "🛡️ Installing KubeArmor..."
+      - helm repo add kubearmor https://kubearmor.github.io/charts
+      - helm repo update kubearmor
+      - helm upgrade --install kubearmor-operator kubearmor/kubearmor-operator -n kubearmor --create-namespace
+    silent: true
+
+  full-deployment:
+    desc: "Run the full deployment sequence: Create infra, update kubeconfig, install metrics server, cilium, upgrade cilium for hubble, install kuverno, and install chaos mesh."
+    cmds:
+      - task: create-infra
+      - task: update-kubeconfig
+      - task: install-metrics-server
+      - task: install-cilium
+      - task: upgrade-cilium-for-hubble
+      - task: install-kuverno
+      - task: install-chaosmesh
+      - task: install-kubescape-operator
+      - task: install-cilium-demo
+      - task: install-kubeArmor
+      - task: restart-existing-pods
+    silent: true

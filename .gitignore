@@ -1,0 +1,17 @@
+awscred
+*awscred*
+
+*.crt
+*.key
+
+*.terraform
+*.tfstate
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# Ignore CLI configuration files
+.terraformrc
+terraform.rc
